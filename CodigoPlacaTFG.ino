@@ -2,12 +2,12 @@
   AVIONICA - PROGRAMA PRINCIPAL (nRF52 / Adafruit Arduino Core)
 
   Solo coordina la placa. Las funciones de sensores y comunicaciones
-  se implementan en las otras dos pestañas .ino.
+  se implementan en las otras tres pestañas .ino.
 
-  IMPORTANTE: el código original solo declaraba los estados; aún NO
-  implementa las transiciones ni el disparo de los paracaídas.
+  IMPORTANTE: las transiciones son lógicas, no accionan paracaídas.
 */
-struct ConfiguracionLoRa; // Adelanto para los prototipos autogenerados de Arduino.
+struct ConfiguracionLoRa; // Adelantos necesarios para los prototipos de Arduino.
+struct RegistroFlash;
 
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
@@ -19,8 +19,11 @@ struct ConfiguracionLoRa; // Adelanto para los prototipos autogenerados de Ardui
   #define FRECUENCIA_LOOP_HZ 100
             // Frecuencia objetivo (compilación); antes: 20 ms
 
-  #define modoTest readTemperature
-            // AVISO: revisar antes del vuelo
+  #define modoTest false
+            // Ojo que para los lanzamientos esto esté en false
+            // true: mostrar depuración completa; false: solo diagnóstico de salud
+
+  // Si hay SD al arrancar, se exporta automáticamente el último vuelo de Flash.
 
   #define milisegundosAntesDeApogeo 1000
             // Esto será para poder despegar el paracaídas antes o después del apogeo
@@ -28,6 +31,15 @@ struct ConfiguracionLoRa; // Adelanto para los prototipos autogenerados de Ardui
 
   #define alturaMain 150
             // m sobre altura de despegue
+
+  #define CICLOS_CONFIRMAR_APOGEO 10
+  #define CICLOS_CONFIRMAR_MAIN 10
+  #define TIEMPO_MINIMO_DROGUE_MS 1000
+  #define TIEMPO_ESTABILIDAD_ATERRIZAJE_MS 5000
+            // Confirmaciones para evitar cambios de estado por ruido
+
+  #define periodoMuestreo (1000.0f / FRECUENCIA_LOOP_HZ)
+            // ms por ciclo; utilizado en la detección de apogeo
 ////////////////////////////////////
 
 
@@ -52,10 +64,21 @@ struct ConfiguracionLoRa; // Adelanto para los prototipos autogenerados de Ardui
 
 
 
+//////////////////////////////////// Globales generales
+
+  // Referencias utilizadas para enviar telemetría relativa al despegue.
+  float alturaDespegue = 220.0f;
+  float latitudDespegue = 41.685109f;    // Mantener valores originales por ahora
+  float longitudDespegue = -0.887776f;  // TODO: obtener de GPS antes de despegue
+
+////////////////////////////////////
+
+
+
+
 //////////////////////////////////// Máquina de estados
   enum estados {
     cohete_desarmado,
-    inicio,
     esperando_despegue,
     ascenso,
     drogue_desplegado,
@@ -63,51 +86,118 @@ struct ConfiguracionLoRa; // Adelanto para los prototipos autogenerados de Ardui
     aterrizado
   };
 
-  char estadoDelCohete = cohete_desarmado;
+  char estadoDelCohete = cohete_desarmado; // Armado lógico; espera pulsación del botón
 
-  // Referencias utilizadas para enviar telemetría relativa al despegue.
-  float alturaDespegue = 220.0f;
-  float latitudDespegue = 41.685109f;    // Mantener valores originales por ahora
-  float longitudDespegue = -0.887776f;  // TODO: obtener de GPS antes de despegue
+  float velocidadVertical = 0.0f;
+  bool velocidadValida = false;
 
   void actualizarMaquinaDeEstados() {
-    // No había transiciones implementadas en el archivo original.
-    // Completar aquí las condiciones de cada estado antes de utilizarlo en vuelo.
-    switch (estadoDelCohete) {
-      case cohete_desarmado:      break;
-      case inicio:                break;
-      case esperando_despegue:               
-        deteccionApogeo(); // Esto tan solo se ejecuta para ir llenando la memoria con la altura actual
-        break;
-      case ascenso:               
-        bool apogeo = deteccionApogeo();
-        break;
-      case drogue_desplegado:     break;
-      case paracaidas_desplegado: break;
-      case aterrizado:            break;
-    }
-  }
+    static uint8_t ciclosAceleracion = 0, ciclosApogeo = 0, ciclosMain = 0;
+    static bool botonLecturaAnterior = false, botonEstable = false;
+    static uint32_t instanteCambioBoton = 0, instanteApogeo = 0, inicioEstabilidad = 0;
+    static bool apogeoHabilitado = false;
+    static float alturaMaxima = -100000.0f;
+    static float alturasVelocidad[32] = {};
+    static uint32_t tiemposAltura[32] = {};
+    static uint8_t indiceAltura = 0, numeroAlturas = 0;
 
-  // Esta función va grabando constantemente la altura leída para poder detectar el punto de apogeo
-  // Devuelve cuando estamos en el punto de apogeo y más allá. Se debe ejecutar en cada ciclo
-  float arrayAlturas[128];
-  int punteroArrayAlturas = 0;
-  bool deteccionApogeo(){
-    arrayAlturas[punteroArrayAlturas] = dSt.dato.altitud_barometro;
-    punteroArrayAlturas = (punteroArrayAlturas++) & 0x7F;
-    bool velocidadDeApogeo = 
-          arrayAlturas[punteroArrayAlturas] - arrayAlturas[(punteroArrayAlturas-1) & 0x7F] 
-                <= 
-          pow(  4.95 * ( (float)(periodoMuestreo*128)/1000.0 )   ,  2.0);
-    bool estamosEnMovimiento = 
-          arrayAlturas[punteroArrayAlturas] - arrayAlturas[(punteroArrayAlturas-1) % 128] 
-                >= 
-          pow(  2.475 * ( (float)(periodoMuestreo*128)/1000.0 )   ,   2.0);
-    return velocidadDeApogeo && estamosEnMovimiento;
+    const uint32_t ahora = millis();
+    const bool boton = digitalRead(pin_boton) == LOW;
+    const bool barOK = alturaActualValida();
+    const float altura = obtenerAlturaBarometricaActual();
+
+    // Antirrebote del botón: registrar solo una nueva pulsación estable.
+    if (boton != botonLecturaAnterior) instanteCambioBoton = ahora;
+    bool nuevaPulsacion = false;
+    if (ahora - instanteCambioBoton >= 30 && boton != botonEstable) {
+      botonEstable = boton;
+      nuevaPulsacion = boton;
+    }
+    botonLecturaAnterior = boton;
+
+    // Velocidad vertical: diferencia barométrica entre muestras separadas ~320 ms.
+    velocidadValida = false;
+    if (barOK) {
+      if (numeroAlturas == 32) {
+        uint32_t dt = ahora - tiemposAltura[indiceAltura];
+        if (dt > 0) {
+          velocidadVertical = (altura - alturasVelocidad[indiceAltura]) * 1000.0f / dt;
+          velocidadValida = isfinite(velocidadVertical);
+        }
+      }
+      alturasVelocidad[indiceAltura] = altura;
+      tiemposAltura[indiceAltura] = ahora;
+      indiceAltura = (indiceAltura + 1) & 31;
+      if (numeroAlturas < 32) numeroAlturas++;
+    } else {
+      numeroAlturas = 0;
+      indiceAltura = 0;
+    }
+
+    switch (estadoDelCohete) {
+      case cohete_desarmado:
+        if (nuevaPulsacion && barOK && imuActualValida()) {
+          alturaDespegue = altura;
+          ciclosAceleracion = 0;
+          estadoDelCohete = esperando_despegue;
+        }
+        break;
+
+      case esperando_despegue:
+        if (barOK && aceleracionMayor4G()) {
+          // Congelar la referencia desde el primer ciclo de aceleración.
+          if (++ciclosAceleracion >= 32) {
+            estadoDelCohete = ascenso;
+            numeroAlturas = 0;  // Descartar alturas anteriores al vuelo.
+            indiceAltura = 0;
+            velocidadValida = false;
+          }
+        } else {
+          ciclosAceleracion = 0;
+          if (barOK) alturaDespegue = altura;
+        }
+        break;
+
+      case ascenso:
+        if (barOK && altura > alturaMaxima) alturaMaxima = altura;
+        if (barOK && altura - alturaDespegue > 100.0f) apogeoHabilitado = true;
+        // Exigir 2 m de bajada desde la máxima altura evita falsos apogeos por mesetas.
+        if (apogeoHabilitado && barOK && velocidadValida &&
+            alturaMaxima - altura >= 2.0f && velocidadVertical <= 0.0f) {
+          if (++ciclosApogeo >= CICLOS_CONFIRMAR_APOGEO) {
+            estadoDelCohete = drogue_desplegado;
+            instanteApogeo = ahora;
+          }
+        } else ciclosApogeo = 0;
+        break;
+
+      case drogue_desplegado:
+        // Umbral del principal solo en descenso y con un tiempo mínimo tras el apogeo.
+        if (ahora - instanteApogeo >= TIEMPO_MINIMO_DROGUE_MS &&
+            barOK && velocidadValida && velocidadVertical < -0.5f &&
+            altura - alturaDespegue < alturaMain) {
+          if (++ciclosMain >= CICLOS_CONFIRMAR_MAIN)
+            estadoDelCohete = paracaidas_desplegado;
+        } else ciclosMain = 0;
+        break;
+
+      case paracaidas_desplegado:
+        // Aterrizaje: velocidad pequeña durante 5 segundos consecutivos.
+        if (barOK && velocidadValida && fabsf(velocidadVertical) < 1.0f) {
+          if (inicioEstabilidad == 0) inicioEstabilidad = ahora;
+          if (ahora - inicioEstabilidad >= TIEMPO_ESTABILIDAD_ATERRIZAJE_MS)
+            estadoDelCohete = aterrizado;
+        } else inicioEstabilidad = 0;
+        break;
+
+      case aterrizado:
+        break;
+    }
+
+    actualizarEstadoEnDatos();
+    // Estados SOLO lógicos. Los paracaídas se despliegan mecánicamente.
   }
 ////////////////////////////////////
-
-
 
 
 //////////////////////////////////// Inicialización - se ejecuta una vez al principio. Inicializaciones de los sensores
@@ -145,6 +235,8 @@ void setup() {
     delay(1000);
   }
 
+  exportarUltimoVueloASD(); // Autoexportar al insertar SD al arrancar, sin borrar Flash
+
   error = iniciarRadio();
   if (error != RADIOLIB_ERR_NONE) {
     Serial.print("Error inicializando el LoRa: ");
@@ -169,8 +261,20 @@ void loop() {
 
   procesarGPS();                 // Decodifica los caracteres pendientes del UART
   leerSensores();                // IMU, magnetómetro, barómetro y último GPS
-  actualizarMaquinaDeEstados();  // Pendiente de implementar transiciones
-  guardarEnMemorias(false, true);// Flash sin implementar; SD activada
+  comprobarEstadoSensores();     // Test periódico de comunicación y valores
+  actualizarMaquinaDeEstados();  // Transiciones de vuelo
+  actualizarHistorial();         // RAM: guarda SIEMPRE las últimas 128 muestras
+  static bool aterrizajeGuardado = false;
+  if (estadoDelCohete >= ascenso) {
+    // Flash: registra desde el despegue hasta llenarse, incluso tras el aterrizaje.
+    // SD: registra hasta aterrizar y después se cierra para proteger el CSV.
+    if (estadoDelCohete < aterrizado) guardarEnMemorias(true, true);
+    else if (!aterrizajeGuardado) {
+      guardarEnMemorias(true, true);
+      finalizarGuardado();
+      aterrizajeGuardado = true;
+    } else guardarEnMemorias(true, false);
+  }
   enviarTelemetriaSiToca();      // Envío LoRa cada ~200 ms
   actualizarIndicadores();       // Botón, LED y buzzer (comportamiento original)
   mostrarDebug(micros() - inicioComputo);

@@ -1,10 +1,10 @@
 /*
  * TELEMETRÍA Y MEMORIAS
  * LoRa: inicialización, compresión y transmisión.
- * SD/Flash: inicialización y almacenamiento; depuración por Serial.
+ * SD/Flash: inicialización y almacenamiento.
  * Interfaz para el principal:
  *   iniciarMemorias(), iniciarRadio(), guardarEnMemorias(),
- *   enviarTelemetriaSiToca(), mostrarDebug().
+ *   enviarTelemetriaSiToca().
  */
 #include <SPI.h>
 #include <RadioLib.h>
@@ -12,6 +12,7 @@
 #include "flash_devices.h"
 #include <SdFat.h>
 #include <math.h>
+#include <stddef.h>
 
 // Pines de SD originales.
 #define SD_nCS  8
@@ -19,17 +20,12 @@
 #define SD_MOSI 14
 #define SD_MISO 15
 
-#define cuantosSaltarseDebug 1
-#define debugPrintDatos true
-#define debugDatosBytes false
-#define debugParaSerialPlotter false
-#define debugTiempoComputo true
-#define debugGPS false
-#define debugRecepcionGPS false
-#define debuggearValorMedioSensores false
+#define INTERVALO_SYNC_SD_MS 250  // Confirmar en SD cada 250 ms (no en cada muestra)
+#define VELOCIDAD_SPI_SD_MHZ 8    // Velocidad conservadora para empezar las pruebas
 
-// Flags originales. El programa original todavía no los actualiza.
-char flagsSensoresActivos = 0;
+
+// Flags originales: representan el estado de cada componente.
+uint8_t flagsSensoresActivos = 0;
 #define tfixGPSmenorA200ms 0x01
 #define hdopGPSmenorA5m    0x02
 #define IMUfuncionando     0x04
@@ -104,6 +100,9 @@ char datosAmandar[14];  // Formato binario original, 14 bytes.
   SdFat SD;
   SPIClass SD_SPI(NRF_SPIM1, SD_MISO, SD_SCK, SD_MOSI);
   File archivo_salida;
+  uint32_t ultimoSyncSD = 0;
+  bool datosPendientesSD = false;
+  bool errorEscrituraSD = false;
 
   // Memoria Flash
   Adafruit_FlashTransport_QSPI flashTransport;
@@ -117,45 +116,192 @@ char datosAmandar[14];  // Formato binario original, 14 bytes.
 
 
 
+
+//////////////////////////////////// Registro binario de la Flash QSPI
+  // 128 bytes por muestra: dos muestras por pagina fisica de 256 bytes.
+  // NUNCA se borran automaticamente los registros anteriores.
+  #define TAM_REGISTRO_FLASH 128UL
+  #define MARCA_REGISTRO_FLASH 0x31415644UL  // Identificador de este formato
+  #define FIN_REGISTRO_FLASH 0xC0DEC0DEUL
+
+  struct RegistroFlash {
+    uint32_t marca;
+    uint32_t tiempo_ms;
+    uint8_t datos[sizeof(dSt.byte)];
+    uint8_t flags;
+    uint32_t checksum;
+    uint32_t confirmado;                  // Se escribe en una SEGUNDA operacion
+    uint32_t vuelo;                       // Nuevo: ID persistente del vuelo
+    uint32_t vuelo_inverso;               // Permite detectar ID incompleto
+  };
+  static_assert(sizeof(RegistroFlash) <= TAM_REGISTRO_FLASH,
+                "RegistroFlash excede los 128 bytes reservados");
+
+  bool flashInicializada = false;
+  bool flashListaParaGuardar = false;
+  uint32_t siguienteDireccionFlash = 0;
+  uint32_t ultimoVueloFlash = 0;
+  uint32_t vueloFlashActual = 0;
+  uint32_t inicioUltimoVueloLegado = UINT32_MAX;
+  bool ultimoVueloConIdentificador = false;
+  bool sdInicializada = false;
+
+  bool tieneIDVueloValido(const RegistroFlash &r) {
+    return r.vuelo != 0 && r.vuelo != 0xFFFFFFFFUL &&
+           r.vuelo_inverso == ~r.vuelo;
+  }
+
+  uint32_t checksumFlash(const RegistroFlash &registro) {
+    uint32_t hash = 2166136261UL;        // FNV-1a, detecta registros incompletos
+    const uint8_t* p = (const uint8_t*)&registro;
+    for (size_t i = 0; i < offsetof(RegistroFlash, checksum); i++) {
+      hash = (hash ^ p[i]) * 16777619UL;
+    }
+    return hash;
+  }
+
+  bool registroFlashValido(const RegistroFlash &registro) {
+    return registro.marca == MARCA_REGISTRO_FLASH &&
+           registro.confirmado == FIN_REGISTRO_FLASH &&
+           registro.checksum == checksumFlash(registro);
+  }
+
+  // No sobrescribe nunca. Soporta registros antiguos, anteriores al ID de vuelo.
+  bool localizarFinalFlash() {
+    uint8_t bloque[TAM_REGISTRO_FLASH] __attribute__((aligned(4)));
+    uint8_t estadoAnterior = 0xFF;
+    uint32_t tiempoAnterior = 0;
+    bool hayRegistroAnterior = false;
+    for (uint32_t dir = 0; dir + TAM_REGISTRO_FLASH <= flash.size();
+         dir += TAM_REGISTRO_FLASH) {
+      if (flash.readBuffer(dir, bloque, sizeof(bloque)) != sizeof(bloque)) return false;
+      bool vacio = true;
+      for (size_t j = 0; j < sizeof(bloque); j++) {
+        if (bloque[j] != 0xFF) { vacio = false; break; }
+      }
+      if (vacio) { siguienteDireccionFlash = dir; return true; }
+
+      RegistroFlash registro = {};
+      memcpy(&registro, bloque, sizeof(registro));
+      if (dir == 0 && registro.marca != MARCA_REGISTRO_FLASH) {
+        Serial.println("Flash con datos desconocidos; NO se sobrescribe.");
+        return false;
+      }
+      if (!registroFlashValido(registro)) continue; // Corte de alimentación: celda parcial
+      if (tieneIDVueloValido(registro)) {
+        if (registro.vuelo > ultimoVueloFlash) ultimoVueloFlash = registro.vuelo;
+        ultimoVueloConIdentificador = true;
+      } else {
+        // Compatible con registros antiguos sin ID: detectar último ASCENSO.
+        unionDatos muestraAntigua = {};
+        memcpy(muestraAntigua.byte, registro.datos, sizeof(muestraAntigua.byte));
+        const uint8_t estado = (uint8_t)muestraAntigua.dato.estado;
+        if (estado == ascenso &&
+            (!hayRegistroAnterior || estadoAnterior != ascenso ||
+             registro.tiempo_ms < tiempoAnterior)) inicioUltimoVueloLegado = dir;
+        estadoAnterior = estado;
+        tiempoAnterior = registro.tiempo_ms;
+        hayRegistroAnterior = true;
+      }
+    }
+    siguienteDireccionFlash = flash.size();
+    return true;
+  }
+
+  bool guardarMuestraFlash() {
+    if (!flashListaParaGuardar) return false;
+    if (siguienteDireccionFlash + TAM_REGISTRO_FLASH > flash.size()) {
+      flashListaParaGuardar = false;
+      flagsSensoresActivos &= ~FLASHfuncionando;
+      return false;
+    }
+
+    // Un ID nuevo para cada despegue. El anterior se recupera al arrancar.
+    if (!vueloFlashActual) {
+      if (ultimoVueloFlash == UINT32_MAX) return false;
+      vueloFlashActual = ultimoVueloFlash + 1;
+      ultimoVueloFlash = vueloFlashActual;
+    }
+
+    RegistroFlash registro = {};
+    registro.marca = MARCA_REGISTRO_FLASH;
+    registro.tiempo_ms = millis();
+    memcpy(registro.datos, dSt.byte, sizeof(dSt.byte));
+    registro.flags = flagsSensoresActivos;
+    registro.checksum = checksumFlash(registro);
+    registro.confirmado = 0xFFFFFFFFUL; // Todavía no confirmado
+    registro.vuelo = vueloFlashActual;
+    registro.vuelo_inverso = ~registro.vuelo;
+
+    // Dos fases: datos e ID primero, confirmación AL FINAL.
+    // El formato anterior sigue siendo legible: el checksum no cambia.
+    const uint32_t dir = siguienteDireccionFlash;
+    if (flash.writeBuffer(dir, (const uint8_t*)&registro, sizeof(registro)) != sizeof(registro)) {
+      flashListaParaGuardar = false;
+      flagsSensoresActivos &= ~FLASHfuncionando;
+      return false;
+    }
+    const uint32_t confirmado = FIN_REGISTRO_FLASH;
+    if (flash.writeBuffer(dir + offsetof(RegistroFlash, confirmado),
+                          (const uint8_t*)&confirmado, sizeof(confirmado)) != sizeof(confirmado)) {
+      flashListaParaGuardar = false;      // No reintentar sobre una celda a medio escribir
+      flagsSensoresActivos &= ~FLASHfuncionando;
+      return false;
+    }
+    flash.waitUntilReady();               // Esperar a que termine la programacion real
+    siguienteDireccionFlash += TAM_REGISTRO_FLASH;
+    return true;
+  }
+////////////////////////////////////
+
 //////////////////////////////////// Funciones de las flash
   char iniciarMemorias(){
     char out = 0;
-    bool SDfuncional = true;
     //Flash
-      if(!flash.begin(&W25Q128JVPIQ, 1)){
-        Serial.println("Error iniciando la flash");
+      flashInicializada = flash.begin(&W25Q128JVPIQ, 1);
+      if(!flashInicializada || !localizarFinalFlash()){
+        Serial.println("Error iniciando el registro Flash");
         out |= 0x1;
-      };
-    //SD  
+      }else{
+        flashListaParaGuardar = siguienteDireccionFlash + TAM_REGISTRO_FLASH <= flash.size();
+        if (flashListaParaGuardar) {
+          flagsSensoresActivos |= FLASHfuncionando;
+          Serial.print("Flash: siguiente direccion = ");
+          Serial.println(siguienteDireccionFlash);
+        }else{
+          Serial.println("Flash llena. Exportar los datos antes de borrarla.");
+          out |= 0x1;
+        }
+      }
+    //SD: el objeto SD usa SD_SPI, NO el SPI del LoRa
+      pinMode(SD_nCS, OUTPUT);
+      digitalWrite(SD_nCS, HIGH);
       SD_SPI.begin();
-      pinMode(SD_nCS,OUTPUT);
-      //delay(10); //Lo meto porque si, no lo recomiendan en ningún lado
-      //SD_SPI.setPins(SD_MISO, SD_SCK, SD_MOSI);
-      if (!SD.begin(SD_nCS)) {
+      sdInicializada = SD.begin(SdSpiConfig(SD_nCS, DEDICATED_SPI,
+                                  SD_SCK_MHZ(VELOCIDAD_SPI_SD_MHZ), &SD_SPI));
+      if(!sdInicializada){
         Serial.println("Error al inicializar la tarjeta SD");
         out |= 0x2;
-        SDfuncional = false;
-      }
-    //Archivo de la SD
-        if(SDfuncional){
-          SD.remove("salida.txt");
-          archivo_salida = SD.open("salida.txt", FILE_WRITE);
-          if(!archivo_salida){
-            Serial.println("Error al crear el archivo de salida");
-            out |= 0x4;
+      }else{
+        // No borrar el archivo anterior. Crear uno nuevo en cada arranque.
+        char nombre[13];
+        for(unsigned int i = 0; i < 1000; i++){
+          snprintf(nombre, sizeof(nombre), "VUELO%03u.CSV", i);
+          if(!SD.exists(nombre)){
+            archivo_salida = SD.open(nombre, FILE_WRITE);
+            break;
           }
-          #if modoTest
-            if(archivo_salida){
-              archivo_salida.close();
-              archivo_salida = SD.open("test.txt", FILE_WRITE);
-              archivo_salida.println("Tonto el que lo lea");
-              archivo_salida.close();
-              Serial.println("Archivo de test escrito y cerrado");
-              archivo_salida = SD.open("salida.txt", FILE_WRITE);
-            }
-          #endif
         }
-        
+        if(!archivo_salida){
+          Serial.println("Error creando el archivo de registro (o no hay nombres libres)");
+          out |= 0x4;
+        }else{
+          Serial.print("Guardando en: ");
+          Serial.println(nombre);
+          flagsSensoresActivos |= SDfuncionando;
+          ultimoSyncSD = millis();
+        }
+      }
     return out;
   }
 ////////////////////////////////////
@@ -205,29 +351,29 @@ char datosAmandar[14];  // Formato binario original, 14 bytes.
       estado[4:0],temp[ 10:8]   hasta 32 estados
       flags[ 7:0]               la variable "flagsSensoresActivos"
       */
-    int lecturaAcelerometro = (int)(dSt.dato.acc[0] * (65536.0/16.0));
+    int lecturaAcelerometro = (int)((isfinite(dSt.dato.acc[0]) ? dSt.dato.acc[0] : 0.0f) * (65536.0/16.0));
     datosAmandar[0] = lecturaAcelerometro & 0xFF;
     datosAmandar[1] = (lecturaAcelerometro>>8) & 0xFF;
 
-    int xMagn = (int)(dSt.dato.magn[0] * 20);
-    int yMagn = (int)(dSt.dato.magn[1] * 20);
-    int zMagn = (int)(dSt.dato.magn[2] * 20);
+    int xMagn = (int)((isfinite(dSt.dato.magn[0]) ? dSt.dato.magn[0] : 0.0f) * 20);
+    int yMagn = (int)((isfinite(dSt.dato.magn[1]) ? dSt.dato.magn[1] : 0.0f) * 20);
+    int zMagn = (int)((isfinite(dSt.dato.magn[2]) ? dSt.dato.magn[2] : 0.0f) * 20);
     datosAmandar[2] = xMagn & 0xFF;
     datosAmandar[3] = (xMagn>>8) & 0xF | (yMagn<<4) & 0xF0;
     datosAmandar[4] = (yMagn>>4) & 0xFF;
     datosAmandar[5] = zMagn & 0xFF;
 
-    int altura = (int)(dSt.dato.altitud_barometro) - alturaDespegue;
+    int altura = (int)(isfinite(dSt.dato.altitud_barometro) ? dSt.dato.altitud_barometro : alturaDespegue) - alturaDespegue;
     datosAmandar[6] = (zMagn>>8) & 0xF | (altura<<4) & 0xF0;
     datosAmandar[7] = (altura>>4) & 0xFF;
 
-    int metrosNorte = (int)((dSt.dato.latitud-latitudDespegue)*40075000/360.0);
-    int metrosEste = (int)((dSt.dato.longitud-longitudDespegue)*40075000/360.0) * cos(dSt.dato.latitud*2.0*M_PI/360.0); //Para la distorsión cerca de los polos
+    int metrosNorte = isfinite(dSt.dato.latitud) ? (int)((dSt.dato.latitud-latitudDespegue)*40075000/360.0) : 0;
+    int metrosEste = (isfinite(dSt.dato.longitud) && isfinite(dSt.dato.latitud)) ? (int)((dSt.dato.longitud-longitudDespegue)*40075000/360.0) * cos(dSt.dato.latitud*2.0*M_PI/360.0) : 0; //Para la distorsión cerca de los polos
     datosAmandar[8] = metrosNorte & 0xFF;
     datosAmandar[9] = (metrosNorte>>8) & 0xF | (metrosEste<<4) & 0xF0;
     datosAmandar[10] = (metrosEste>>4) & 0xFF;
 
-    int temp = (int)(dSt.dato.temperatura*10.0-200.0);
+    int temp = (int)((isfinite(dSt.dato.temperatura) ? dSt.dato.temperatura : 20.0f)*10.0-200.0);
     datosAmandar[11] = temp & 0xFF;
 
     datosAmandar[12] = (temp>>8) & 0x7 | (estadoDelCohete<<3) & 0xF8;
@@ -260,110 +406,134 @@ char datosAmandar[14];  // Formato binario original, 14 bytes.
     return strlen(destino);
   }
 
+
+  // Al encender, si hay SD y registros de vuelo, exportar el ÚLTIMO vuelo.
+  // LOG000.CSV... nunca sobrescribe archivos ni borra la Flash.
+  bool exportarUltimoVueloASD() {
+    if (!sdInicializada || !flashInicializada) return false;
+    if (!ultimoVueloConIdentificador && inicioUltimoVueloLegado == UINT32_MAX) {
+      Serial.println("[FLASH] Sin vuelos anteriores para exportar.");
+      return false;
+    }
+
+    // El último vuelo puede ser el nuevo formato (ID) o datos heredados.
+    const bool conID = ultimoVueloConIdentificador;
+    const uint32_t vuelo = ultimoVueloFlash;
+    char nombre[13] = {};
+    for (unsigned int i = 0; i < 1000; i++) {
+      snprintf(nombre, sizeof(nombre), "LOG%03u.CSV", i);
+      if (!SD.exists(nombre)) break;
+      nombre[0] = 0;
+    }
+    if (!nombre[0]) {
+      Serial.println("[FLASH] Sin nombres LOG libres.");
+      return false;
+    }
+
+    File destino = SD.open(nombre, FILE_WRITE);
+    if (!destino) {
+      Serial.println("[FLASH] Error creando CSV de recuperación.");
+      return false;
+    }
+
+    unionDatos original = dSt;
+    uint32_t recuperados = 0, descartados = 0;
+    bool correcto = true;
+    RegistroFlash registro;
+    for (uint32_t dir = 0; dir < siguienteDireccionFlash; dir += TAM_REGISTRO_FLASH) {
+      if (flash.readBuffer(dir, (uint8_t*)&registro, sizeof(registro)) != sizeof(registro)) {
+        correcto = false;
+        break;
+      }
+      if (!registroFlashValido(registro)) { descartados++; continue; }
+      if (conID) {
+        if (!tieneIDVueloValido(registro) || registro.vuelo != vuelo) continue;
+      } else if (dir < inicioUltimoVueloLegado || tieneIDVueloValido(registro)) continue;
+
+      memcpy(dSt.byte, registro.datos, sizeof(dSt.byte));
+      const int n = datosAcsv(buffer);
+      destino.print(registro.tiempo_ms);
+      destino.write((uint8_t)'\t');
+      if (destino.write((const uint8_t*)buffer, n) != (size_t)n) {
+        correcto = false;
+        break;
+      }
+      recuperados++;
+    }
+    dSt = original;
+    if (!destino.sync()) correcto = false;
+    destino.close();
+
+    Serial.print("[FLASH] Último vuelo -> "); Serial.print(nombre);
+    Serial.print(" muestras="); Serial.print(recuperados);
+    Serial.print(" incompletas="); Serial.print(descartados);
+    Serial.print(" resultado="); Serial.println(correcto ? "OK" : "ERROR");
+    return correcto && recuperados > 0;
+  }
+
   char guardarEnMemorias(bool enFlash, bool enSD){
     char out = 0;// Si no es 0 ha habido un error
-    int longitud = datosAcsv(buffer);
-    bufferLength = longitud;
-    if(enFlash){
-      //Acabar
-      /*
-      flash.eraseChip();
-      flash.eraseSector(0);
-      flash.waitUntilReady();
-      flash.writeBuffer(addr, bufwrite, sizeof(bufwrite));
-      flash.readBuffer(addr, bufread, sizeof(bufread));
-      */
-
-      out |= 0x1;
-    }
+    // En Flash solamente, no gastar tiempo formateando cada muestra como CSV.
+    int longitud = 0;
+    if (enSD) { longitud = datosAcsv(buffer); bufferLength = longitud; }
+    if (enFlash && flashListaParaGuardar && !guardarMuestraFlash()) out |= 0x1;
     if(enSD){
-      if(archivo_salida){
+      if(archivo_salida && !errorEscrituraSD){
         int longitudSD = archivo_salida.print(buffer);
-        archivo_salida.flush();
         if(longitudSD != longitud){
+          errorEscrituraSD = true; // No seguir escribiendo tras una línea incompleta.
           out |= 0x2;
+          flagsSensoresActivos &= ~SDfuncionando;
+        }else{
+          datosPendientesSD = true;
+        }
+
+        // SdFat ya utiliza una caché. sync() confirma datos y metadatos,
+        // pero hacerlo en CADA ciclo provoca paradas innecesarias.
+        if(datosPendientesSD && millis() - ultimoSyncSD >= INTERVALO_SYNC_SD_MS){
+          ultimoSyncSD = millis();
+          if(archivo_salida.sync()){
+            datosPendientesSD = false;
+            if(!errorEscrituraSD) flagsSensoresActivos |= SDfuncionando;
+          }else{
+            out |= 0x2;
+            flagsSensoresActivos &= ~SDfuncionando;
+          }
         }
       }else{
         out |= 0x2;
+        flagsSensoresActivos &= ~SDfuncionando;
       }
     }
     //Serial.print(buffer);
 
     return out;
   }
-////////////////////////////////////
-
-
-
-//////////////////////////////////// Depuración
-  void debuggearTodo(){
-    cont++;
-    if(cont == cuantosSaltarseDebug){
-
-      #if debugRecepcionGPS
-        Serial.print(recepcionGPS);
-      #endif
-
-      #if debugPrintDatos
-        sprintf(buffer, "%2d-%2d-20%2d %2d:%2d:%2d ACEL:% 2.6f,% 2.6f,% 2.6f GIRO:% 6.2f,% 6.2f,% 6.2f MAG:% 6.2f,% 6.2f,% 6.2f GPS:%f,%f,h:%.2f,v:%.3f,hdop:%.2f,fix:%4d BAR:%4.4f,% 3.2f,h:% 4.2f",
-          dSt.dato.fecha[0],dSt.dato.fecha[1],dSt.dato.fecha[2],dSt.dato.tiempo[2],dSt.dato.tiempo[1],dSt.dato.tiempo[0],
-          dSt.dato.acc[0],dSt.dato.acc[1],dSt.dato.acc[2],dSt.dato.gyro[0],dSt.dato.gyro[1],dSt.dato.gyro[2],dSt.dato.magn[0],dSt.dato.magn[1],dSt.dato.magn[2],
-          /*(dSt.dato.gpsValido)? 1:0,*/ dSt.dato.latitud, dSt.dato.longitud, dSt.dato.altitud, dSt.dato.velocidad,dSt.dato.hdop,dSt.dato.tiempoDesdeUltimoFix,
-          dSt.dato.presion,dSt.dato.temperatura,dSt.dato.altitud_barometro);
-        Serial.println(buffer);
-      #endif
-
-      #if debugGPS
-        sprintf(buffer, "%2d:%2d:%2d %2d-%2d-20%2d , valido=%d, %f,%f,%.2f,%.3f,hdop:%.2f,fix:%4d x:%f, y:%f",
-          dSt.dato.tiempo[2],dSt.dato.tiempo[1],dSt.dato.tiempo[0],dSt.dato.fecha[0],dSt.dato.fecha[1],dSt.dato.fecha[2],
-          (dSt.dato.gpsValido)? 1:0, dSt.dato.latitud, dSt.dato.longitud, dSt.dato.altitud, dSt.dato.velocidad,dSt.dato.hdop,dSt.dato.tiempoDesdeUltimoFix,
-          (dSt.dato.latitud-41.685455)*111317.099692, (dSt.dato.longitud+0.887576)*111317.099692); //radio_de_la_tierra * 2pi / 360
-        Serial.println(buffer);
-      #endif
-
-      #if debugDatosBytes
-        for(int i=0; i<sizeof(dSt.byte); i++){
-          sprintf(buffer, "%3d ", dSt.byte[i]);
-          Serial.print(buffer);
-        }
-        Serial.print("bytes:");
-        Serial.println(sizeof(dSt.byte));
-      #endif
-      
-      #if debugParaSerialPlotter
-        sprintf(buffer, "Variable_1:%f,Variable_2:%f,Variable_3:%f,Variable_4:%f,Variable_5:%f,Variable_6:%f,Variable_7:%d,Variable_8:%f,Variable_9:%f,Variable_10:%f,Variable_11:%f",
-          dSt.dato.acc[0],dSt.dato.acc[1],dSt.dato.acc[2],dSt.dato.gyro[0],dSt.dato.gyro[1],dSt.dato.gyro[2],
-          (dSt.dato.gpsValido)? 1:0, dSt.dato.latitud, dSt.dato.longitud, dSt.dato.altitud, dSt.dato.velocidad);
-        Serial.println(buffer);
-      #endif
-
-      #if debuggearValorMedioSensores
-        for(int i=0; i<3; i++){
-          mediaAcc[i]  += gananciaParaLaMedia*(dSt.dato.acc[i]-mediaAcc[i]);
-          mediaGiro[i] += gananciaParaLaMedia*(dSt.dato.gyro[i]-mediaGiro[i]);
-          mediaMagn[i] += gananciaParaLaMedia*(dSt.dato.magn[i]-mediaMagn[i]);
-        }
-        
-        sprintf(buffer, "IMU:% 2.9f,% 2.9f,% 2.9f,% 6.6f,% 6.6f,% 6.6f MAG:% 6.6f,% 6.6f,% 6.6f",
-          mediaAcc[0],mediaAcc[1],mediaAcc[2],mediaGiro[0],mediaGiro[1],mediaGiro[2],mediaMagn[0],mediaMagn[1],mediaMagn[2]);
-        Serial.println(buffer);
-      #endif
-
-      cont = 0;
-    }
-  }
-
-  // Debe llamarse al final de cada ciclo: conserva la impresión original
-  // de tiempo de cómputo incluso con modoTest desactivado.
-  void mostrarDebug(uint32_t tiempoComputoUs) {
-    #if modoTest
-      debuggearTodo();
-    #endif
-    #if debugTiempoComputo
-      if (cont == 0) {
-        Serial.print("Tiempo computo (us):");
-        Serial.println(tiempoComputoUs);
-      }
-    #endif
+  // Se llama una vez al aterrizar, para no dejar datos pendientes en la SD.
+  bool finalizarGuardado() {
+    if (!archivo_salida) return false;
+    bool correcto = archivo_salida.sync();
+    archivo_salida.close();
+    datosPendientesSD = false;
+    if (!correcto) flagsSensoresActivos &= ~SDfuncionando;
+    return correcto;
   }
 ////////////////////////////////////
+
+
+
+//////////////////////////////////// Diagnóstico: flags de salud y mensaje por Serial
+  // Los bits originales de LoRa se conservan, sin cambiar su posición.
+  void actualizarFlagsSensores(bool gpsReciente, bool gpsPreciso, bool imuOK, bool magOK, bool barOK){
+    // Los estados de SD y Flash se actualizan en las funciones de memoria.
+    uint8_t flags = flagsSensoresActivos & (SDfuncionando | FLASHfuncionando);
+    if(gpsReciente) flags |= tfixGPSmenorA200ms;
+    if(gpsPreciso) flags |= hdopGPSmenorA5m;
+    if(imuOK)      flags |= IMUfuncionando;
+    if(magOK)      flags |= MAGfuncionando;
+    if(barOK)      flags |= BARfuncionando;
+    #if !modoTest
+      flags |= noEnModoTest;
+    #endif
+    flagsSensoresActivos = flags;
+  }
