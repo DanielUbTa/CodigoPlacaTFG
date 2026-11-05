@@ -294,6 +294,7 @@ void loop() {
   enviarTelemetriaSiToca();      // Envío LoRa cada ~200 ms
   actualizarIndicadores();       // Botón, LED y buzzer (comportamiento original)
   mostrarDebug(micros() - inicioComputo);
+  mostrarAlturaMaximaSerial();
 
   esperarSiguienteCiclo();       // Periodicidad gestionada por FreeRTOS
 }

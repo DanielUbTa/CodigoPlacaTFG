@@ -87,6 +87,20 @@ int cont = 0;
       }
     #endif
   }
+
+  void mostrarAlturaMaximaSerial() {
+    float alturaRelativa = 0.0f;
+
+    if (estadoDelCohete >= ascenso &&
+      isfinite(alturaMaxima) &&
+      isfinite(alturaDespegue) &&
+      alturaMaxima > -99999.0f) {
+      alturaRelativa = fmaxf(0.0f, alturaMaxima - alturaDespegue);
+    }
+    
+    Serial.print("ALTURA_MAXIMA_M: ");
+    Serial.println(alturaRelativa, 2);
+  }
 ////////////////////////////////////
 
 
