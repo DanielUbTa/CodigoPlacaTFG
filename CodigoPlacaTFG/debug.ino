@@ -1,12 +1,12 @@
 /* DEPURACIÓN POR SERIAL */
-#define cuantosSaltarseDebug 1
+#define cuantosSaltarseDebug 10
 #define debugPrintDatos true
 #define debugDatosBytes false
 #define debugParaSerialPlotter false
-#define debugTiempoComputo true
+#define debugTiempoComputo modoTest
 #define debugGPS false
 #define debugRecepcionGPS false
-#define debugEstadoSensores false  // Diagnóstico resumido cada segundo
+#define debugEstadoSensores modoTest  // Diagnóstico resumido cada segundo
 #define debuggearValorMedioSensores false
 
 int cont = 0;
@@ -101,6 +101,9 @@ int cont = 0;
     Serial.print(" ID:0x"); Serial.print(idIMU, HEX);
     Serial.print(" LECT:"); Serial.print(ultimaLecturaIMUValida ? "OK" : "ERROR");
     Serial.print(" FALLOS:"); Serial.print(erroresLecturaIMU);
+    Serial.print(" IMU_SIN_MUESTRA:"); Serial.print(muestrasIMUSinActualizar);
+    Serial.print(" BAR_FRESCO:"); Serial.print(barLecturaFresca ? "SI" : "NO");
+    Serial.print(" FLASH_S:"); Serial.print(segundosFlashDisponibles());
     Serial.print(" MAG:");
     Serial.print((flagsSensoresActivos & MAGfuncionando) ? "OK" : "ERROR");
     Serial.print(" BAR:");

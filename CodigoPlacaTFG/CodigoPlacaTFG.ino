@@ -8,6 +8,7 @@
 */
 struct ConfiguracionLoRa; // Adelantos necesarios para los prototipos de Arduino.
 struct RegistroFlash;
+union unionDatos;  // Adelanto para el prototipo automatico de datosAcsv().
 
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
@@ -37,6 +38,9 @@ struct RegistroFlash;
   #define TIEMPO_MINIMO_DROGUE_MS 1000
   #define TIEMPO_ESTABILIDAD_ATERRIZAJE_MS 5000
             // Confirmaciones para evitar cambios de estado por ruido
+
+  #define FLASH_RESERVA_SEGUNDOS 180
+            // Aviso y bloqueo de armado sin SD si quedan menos de 3 min en Flash
 
   #define periodoMuestreo (1000.0f / FRECUENCIA_LOOP_HZ)
             // ms por ciclo; utilizado en la detección de apogeo
@@ -69,7 +73,8 @@ struct RegistroFlash;
   // Referencias utilizadas para enviar telemetría relativa al despegue.
   float alturaDespegue = 220.0f;
   float latitudDespegue = 41.685109f;    // Mantener valores originales por ahora
-  float longitudDespegue = -0.887776f;  // TODO: obtener de GPS antes de despegue
+  float longitudDespegue = -0.887776f;  // Fallback; sin GPS no se envía posición relativa
+  bool referenciaGPSValida = false;
 
 ////////////////////////////////////
 
@@ -90,13 +95,14 @@ struct RegistroFlash;
 
   float velocidadVertical = 0.0f;
   bool velocidadValida = false;
+  float alturaMaxima = -100000.0f; // Altitud barométrica absoluta máxima de la sesión en vuelo.
 
   void actualizarMaquinaDeEstados() {
     static uint8_t ciclosAceleracion = 0, ciclosApogeo = 0, ciclosMain = 0;
     static bool botonLecturaAnterior = false, botonEstable = false;
     static uint32_t instanteCambioBoton = 0, instanteApogeo = 0, inicioEstabilidad = 0;
+    static float alturaInicioEstabilidad = 0.0f;
     static bool apogeoHabilitado = false;
-    static float alturaMaxima = -100000.0f;
     static float alturasVelocidad[32] = {};
     static uint32_t tiemposAltura[32] = {};
     static uint8_t indiceAltura = 0, numeroAlturas = 0;
@@ -134,9 +140,14 @@ struct RegistroFlash;
       indiceAltura = 0;
     }
 
+    // Registrar la altura máxima a la frecuencia del loop, no solo cada transmisión.
+    // Seguir durante el descenso para no perder nuevos máximos legítimos.
+    if (estadoDelCohete >= ascenso && barOK && altura > alturaMaxima)
+      alturaMaxima = altura;
+
     switch (estadoDelCohete) {
       case cohete_desarmado:
-        if (nuevaPulsacion && barOK && imuActualValida()) {
+        if (nuevaPulsacion && barOK && imuActualValida() && almacenamientoPreparado()) {
           alturaDespegue = altura;
           ciclosAceleracion = 0;
           estadoDelCohete = esperando_despegue;
@@ -159,7 +170,6 @@ struct RegistroFlash;
         break;
 
       case ascenso:
-        if (barOK && altura > alturaMaxima) alturaMaxima = altura;
         if (barOK && altura - alturaDespegue > 100.0f) apogeoHabilitado = true;
         // Exigir 2 m de bajada desde la máxima altura evita falsos apogeos por mesetas.
         if (apogeoHabilitado && barOK && velocidadValida &&
@@ -182,10 +192,16 @@ struct RegistroFlash;
         break;
 
       case paracaidas_desplegado:
-        // Aterrizaje: velocidad pequeña durante 5 segundos consecutivos.
+        // Aterrizaje: velocidad pequeña durante 5 s, con muestras frescas.
         if (barOK && velocidadValida && fabsf(velocidadVertical) < 1.0f) {
-          if (inicioEstabilidad == 0) inicioEstabilidad = ahora;
-          if (ahora - inicioEstabilidad >= TIEMPO_ESTABILIDAD_ATERRIZAJE_MS)
+          if (inicioEstabilidad == 0) {
+            inicioEstabilidad = ahora;
+            alturaInicioEstabilidad = altura;
+          }
+          // Una caída lenta durante 5 s NO equivale a haber aterrizado.
+          if (fabsf(altura - alturaInicioEstabilidad) >= 1.0f) {
+            inicioEstabilidad = 0;
+          } else if (ahora - inicioEstabilidad >= TIEMPO_ESTABILIDAD_ATERRIZAJE_MS)
             estadoDelCohete = aterrizado;
         } else inicioEstabilidad = 0;
         break;

@@ -17,6 +17,7 @@
 
 #define INTERVALO_COMPROBACION_MS 200 // Diagnóstico I2C cada 200 ms
 #define TIMEOUT_GPS_MS 2000
+#define TIMEOUT_BAR_CONGELADO_MS 2500 // Solo se aplica a estados de vuelo
 
 //////////////////////////////////// Configuración IMU LSM6DSO / LSM6DSOX (ID 0x6C)
   #define IMU_DIRECCION_I2C       0x6A
@@ -86,6 +87,9 @@ bool gpsComunicando = false;
 uint32_t ultimaTramaGPS = 0;
 uint8_t idIMU = 0, ctrlAcelIMU = 0, ctrlGiroIMU = 0;
 bool ultimaLecturaIMUValida = false;
+bool barLecturaFresca = false;
+uint32_t ultimaVariacionPresionMs = 0;
+uint32_t muestrasIMUSinActualizar = 0;
 uint32_t erroresLecturaIMU = 0;
 
 // En Telemetria.ino se traduce este estado a los 8 bits del paquete LoRa.
@@ -197,6 +201,17 @@ float mediaAcc[3], mediaGiro[3], mediaMagn[3];
   }
 
   bool leerDatosIMU() {
+    // STATUS_REG: bit 0 = dato nuevo acelerometro, bit 1 = dato nuevo giro.
+    // No contar muestras repetidas si se reduce el ODR por debajo del loop.
+    uint8_t status = 0;
+    if (!leerIdentificadorI2C(IMU_DIRECCION_I2C, 0x1E, status)) {
+      erroresLecturaIMU++;
+      return false;
+    }
+    if ((status & 0x03) != 0x03) {
+      muestrasIMUSinActualizar++;
+      return false;
+    }
     uint8_t raw[12];
     Wire.beginTransmission(IMU_DIRECCION_I2C);
     Wire.write((uint8_t)0x22); // OUTX_L_G: giro[6] seguido de aceleración[6]
@@ -251,7 +266,7 @@ float mediaAcc[3], mediaGiro[3], mediaMagn[3];
       UART_GPS.end();
       UART_GPS.begin(115200);
       UART_GPS.print("$PCAS02,100*1E\r\n"); //Subir a 10Hz
-      UART_GPS.print("$PCAS03,1,0,0,0,0,0,0,0*03\r\n"); //Recivir solo mensajes de GGA
+      UART_GPS.print("$PCAS03,1,0,0,0,1,0,0,0*02\r\n"); // GGA + RMC: posicion, fecha y velocidad
       //UART_GPS.print("$PCAS04,3*1A\r\n"); //Usar BDS y GPS
       UART_GPS.print("$PCAS10,0*1C\r\n"); //Resetear automatico si no va
     //Flash  
@@ -285,7 +300,7 @@ float mediaAcc[3], mediaGiro[3], mediaMagn[3];
 
     dSt.dato.tiempo[0] = gps.time.second();
     dSt.dato.tiempo[1] = gps.time.minute();
-    dSt.dato.tiempo[2] = (gps.time.hour()+1)%24; //Ajustar para hora en España
+    dSt.dato.tiempo[2] = gps.time.hour(); // UTC: no sumar horas sin ajustar fecha
     dSt.dato.fecha[0] = gps.date.day();
     dSt.dato.fecha[1] = gps.date.month();
     dSt.dato.fecha[2] = (char)(gps.date.year() - 2000);
@@ -303,6 +318,13 @@ float mediaAcc[3], mediaGiro[3], mediaMagn[3];
       age = 65535;
     }
     dSt.dato.tiempoDesdeUltimoFix = age;
+    // La referencia geográfica se actualiza solo antes del ascenso.
+    if (estadoDelCohete <= esperando_despegue && dSt.dato.gpsValido &&
+        isfinite(dSt.dato.latitud) && isfinite(dSt.dato.longitud)) {
+      latitudDespegue = dSt.dato.latitud;
+      longitudDespegue = dSt.dato.longitud;
+      referenciaGPSValida = true;
+    }
 
     //Los ejes de la placa son los de la IMU
     ultimaLecturaIMUValida = imuConectada && leerDatosIMU();
@@ -322,9 +344,25 @@ float mediaAcc[3], mediaGiro[3], mediaMagn[3];
     }
 
     if (barConectado) {
-      dSt.dato.presion = ps.readPressureMillibars();
-      dSt.dato.altitud_barometro = ps.pressureToAltitudeMeters(dSt.dato.presion);
+      const float presion = ps.readPressureMillibars();
+      const uint32_t ahora = millis();
+      static bool primeraLectura = true;
+      static float presionAnterior = NAN;
+      if (isfinite(presion) && presion > 50 && presion < 1200) {
+        if (primeraLectura || presion != presionAnterior) ultimaVariacionPresionMs = ahora;
+        primeraLectura = false;
+        presionAnterior = presion;
+      }
+      dSt.dato.presion = presion;
+      dSt.dato.altitud_barometro = ps.pressureToAltitudeMeters(presion);
       dSt.dato.temperatura = ps.readTemperatureC();
+      barLecturaFresca = isfinite(presion) &&
+                         (ahora - ultimaVariacionPresionMs <= TIMEOUT_BAR_CONGELADO_MS);
+    } else {
+      dSt.dato.presion = NAN;
+      dSt.dato.altitud_barometro = NAN;
+      dSt.dato.temperatura = NAN;
+      barLecturaFresca = false;
     }
   }
 //////////////////////////////////// 
@@ -386,7 +424,7 @@ float mediaAcc[3], mediaGiro[3], mediaMagn[3];
       magDatosValidos &= isfinite(dSt.dato.magn[i]);
     }
 
-    bool barDatosValidos = isfinite(dSt.dato.presion) &&
+    bool barDatosValidos = barLecturaFresca && isfinite(dSt.dato.presion) &&
                            dSt.dato.presion > 50.0f && dSt.dato.presion < 1200.0f &&
                            isfinite(dSt.dato.temperatura) && isfinite(dSt.dato.altitud_barometro);
     bool gpsReciente = gpsComunicando && dSt.dato.gpsValido && dSt.dato.tiempoDesdeUltimoFix < 200;
@@ -417,7 +455,8 @@ float mediaAcc[3], mediaGiro[3], mediaMagn[3];
   }
 
   bool alturaActualValida() {
-    return barConectado && isfinite(dSt.dato.altitud_barometro) &&
+    return barConectado && barLecturaFresca &&
+           isfinite(dSt.dato.altitud_barometro) &&
            isfinite(dSt.dato.presion) && dSt.dato.presion > 50 && dSt.dato.presion < 1200;
   }
 
