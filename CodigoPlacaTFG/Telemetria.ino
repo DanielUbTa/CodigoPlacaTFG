@@ -502,7 +502,7 @@ uint8_t flagsSensoresActivos = 0;
     }
     t.vel_vert = velocidadValida ? realSeguro(velocidadVertical) : 0.0f;
     t.temperatura = entero16Seguro(d.temperatura);
-    t.estado = estadoCompatibleArtemisa();
+    t.estado = (int16_t)estadoDelCohete;
 
     // En esta aviónica los paracaídas son mecánicos. No existe medida
     // de continuidad: -1 indica «no disponible», NO «continuidad OK».
