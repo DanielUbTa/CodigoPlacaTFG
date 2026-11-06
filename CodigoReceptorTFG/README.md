@@ -1,40 +1,47 @@
-# Receptor LoRa -> CSV por Serial (Heltec WiFi LoRa 32 V3)
+# Receptor Heltec WiFi LoRa 32 V3: CSV por Serial y datos en pantalla
 
-Este proyecto **no guarda archivos en la Flash ni en una SD**. Recibe tramas binarias LoRa de 64 bytes y envía al ordenador, por USB Serial, una fila CSV por cada paquete válido.
+Recibe los paquetes de **64 bytes** del emisor TFG con RadioLib / SX1262 y conserva exactamente la salida **CSV de 16 columnas** del receptor anterior. No utiliza SD ni LittleFS.
 
-## Cómo utilizarlo
+## Pantalla OLED integrada (128 × 64)
 
-1. Abre `Receptor_Heltec_V3_CSV_Serial.ino` en Arduino IDE (carpeta con el mismo nombre).
-2. Selecciona **WiFi LoRa 32(V3)**, con soporte ESP32-S3, e instala **RadioLib** (API probada mediante interfaces simuladas; se preparó originalmente para RadioLib 7.4.0).
-3. Activa el puerto USB serie adecuado de tu configuración de placa. Si usas USB CDC nativo y no aparece el puerto, revisa **USB CDC On Boot**.
-4. Carga el sketch y abre el monitor serie a **115200 baudios**. Al arrancar aparecerá una cabecera CSV, seguida de una línea por cada paquete recibido.
-5. Puedes usar el registro del monitor serie o un programa en el ordenador para guardar las líneas como `.csv`; el firmware no almacena nada.
+Muestra siempre el **último valor recibido** de `altura_max` (en metros respecto al despegue), `latitud`, `longitud` y **segundos desde el ultimo paquete LoRa valido**:
 
-## Salida de ejemplo (datos ficticios)
+```text
+ALTURA MAXIMA
+320 m
+LAT: 41.685100
+LON: -0.887800
+RX: 0.8s OK
+```
+
+Al inicio se muestran ceros y `RX: SIN DATOS`. Tras cada paquete valido, el contador `RX` vuelve a `0.0s`; crece mientras no llegan paquetes. A partir de 5 segundos aparece `SIN SENAL` y se mantienen las ultimas medidas. Si falla la radio se indica `RADIO ERROR` o `RADIO ERR`, segun el caso. El contador se muestra en segundos con un decimal hasta `9999` segundos. Si la pantalla no esta disponible, la salida por Serial sigue funcionando.
+
+El display se actualiza cada **250 ms** para reducir actividad I2C; el CSV se imprime en cuanto se valida el paquete, sin esperar a la pantalla.
+
+## Instalación en Arduino IDE
+
+1. Instala el soporte ESP32/Heltec V3 y selecciona **WiFi LoRa 32(V3)**.
+2. Instala las bibliotecas **RadioLib**, **Adafruit GFX Library** y **Adafruit SSD1306** (y sus dependencias) desde el gestor de bibliotecas.
+3. Abre `Receptor_Heltec_V3_CSV_OLED_Tiempo.ino` con `Protocolo.h` en la misma carpeta; carga el programa.
+4. Conecta el monitor serie a **115200** baudios. Verás una única cabecera CSV y una fila por cada paquete válido. **No hay mensajes de pantalla ni avisos por Serial** mientras `DEBUG_RECEPTOR` esté a `0`.
+
+### Configuración de hardware
+
+- SX1262: NSS=8, SCK=9, MOSI=10, MISO=11, RESET=12, BUSY=13, DIO1=14.
+- Pantalla SSD1306 I2C: SDA=17, SCL=18, RESET=21, Vext=36 **LOW para alimentar**, dirección `0x3C`.
+- LoRa: 868 MHz, SF9, BW125 kHz, CR 4/5, sync `0x38` y preámbulo 8, sin cambios respecto al receptor anterior.
+
+### CSV por Serial
 
 ```csv
 acc_x,acc_y,acc_z,pitch,roll,yaw,vel,vel_max,latitud,longitud,altura,altura_max,vel_vert,temperatura,estado,flag
 0.0100,-0.0200,1.0100,1.00,-2.00,120.00,12.300,84.500,41.685100,-0.887800,180,320,-8.200,23,2,0
 ```
 
-- Los **16 campos y su orden** corresponden a la estructura `Telemetria` de Artemisa III.
-- Los valores no finitos (`NaN`, `Inf`) se sustituyen por **0**. El `flag=-1`, que indica continuidad no medida en nuestra aviónica, también se transforma en **0**.
-- No se inventan filas para tramas ausentes o corruptas; se descartan tras verificar cabecera, versión, longitud y CRC.
-- **No se imprime** RSSI, secuencia, mensajes `[RX]` ni texto de depuración en modo normal; la salida es CSV limpio.
-- `DEBUG_RECEPTOR = 1` permite ver errores de inicialización LoRa, pero añade líneas de diagnóstico que comienzan por `#` y dejarían de ser un CSV estricto.
+Los valores `NaN`/`Inf` se convierten en `0`; `flag=-1` se normaliza a `0`. Las tramas con CRC o tamaño incorrectos se descartan (no se generan filas falsas). La pantalla lee exactamente los mismos datos saneados que el CSV.
 
-## Configuración de radio
+## Cambios respecto al receptor anterior
 
-La configuración por defecto apunta a **nuestra aviónica LR1110**: 868 MHz, 125 kHz, SF9, coding rate 4/5, sync word 0x38 y preámbulo 8. La Heltec V3 incorpora SX1262 y utiliza CS 8, SCK 9, MOSI 10, MISO 11, RST 12, BUSY 13 y DIO1 14.
+Respecto al receptor OLED anterior se anade el tiempo transcurrido desde el ultimo paquete valido en la linea inferior. Se preservan `Protocolo.h`, la estructura binaria, radio y formateo de CSV.
 
-La **otra placa Artemisa III** utiliza un E220 por UART, canal diferente. Este sketch no recibe simultáneamente ese segundo enlace ni garantiza compatibilidad directa con su modulación. Su estructura de datos es la misma, pero el enlace físico no lo es.
-
-## Archivos
-
-- `Receptor_Heltec_V3_CSV_Serial.ino`: inicialización de SX1262, recepción y escritura CSV por Serial.
-- `Protocolo.h`: estructura de 16 campos, CRC16, decodificación, limpieza y formateo CSV.
-- `tests/test_protocolo.cpp`: prueba de trama y valores no disponibles, incluido CSV.
-
-Referencia: https://github.com/AkaneCelorrioGonzalvo/Electronica-Artemisa-III/tree/main/Placa%20Junio/Codigo_Receptor
-
-**Validación:** prueba de compilación con g++ para el protocolo, pero no se ha compilado ni ejecutado con Arduino IDE y hardware real en esta sesión.
+**Validación:** la sintaxis y el protocolo pueden comprobarse localmente, pero no se ha compilado con las bibliotecas ESP32/Adafruit instaladas en la placa ni probado físicamente.
